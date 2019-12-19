@@ -1,1 +1,5 @@
-# Hospital_Mortality_Rate_Est
+# Hospital Mortality Rate Estimation
+
+Patients often rely on publicly available hospital procedural performance metrics when deciding where to seek treatment. One such public repository is the Society for Thoracic Surgeons' (STS) Congenital Heart Surgery Database where patients can access a hospital reported performance information on complex heart surgeries across five procedure complexity-based categories (1 being less risky, and 5 most risky). Additionally, the STS provides a 3-star rating (1 = worse performance than average, 3 = higher performance than average) to each hospital based on their ratio of observed to expected mortality rates (O/E, 95\% C.I.), where a ratio less than 1 indicates performance is better than expected. Recently, UNC's hospital was forced to suspend their complex pediatric cardiovascular surgical procedures after the New York Times investigation reported it had higher than expected mortality rates. 
+
+Here we aimed to investigate the factors that affect mortality rates, overall and stratified by procedure complexity, for hospitals in the STS's Congenital Heart Surgery Database and UNC, as well as rank the top/bottom 10 hospitals based on predicted O/E performance (95\% CrI).
