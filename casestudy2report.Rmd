@@ -1,0 +1,804 @@
+---
+title: '610: Case Study 2'
+author: "Eduardo Coronado, Azucena Morales, Yangfan Ren"
+date: "12/04/2019"
+fontsize: 11pt
+output:
+  pdf_document: default
+html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(knitr)
+library(gridExtra)
+library(janitor)
+library(R2jags)
+library(tidyr)
+library(brms)
+library(mvtnorm)
+library(tidybayes)
+library(coda)
+library(matrixStats)
+library(kableExtra)
+```
+
+
+```{r load_data, include=FALSE}
+options(scipen=1, digits=2)
+knitr::opts_chunk$set(echo = F, warning = F, fig.width = 8, fig.height = 4)
+load("cardiomort.RData")
+unc_data <- read_csv("unc_data.csv")
+set.seed(13)
+```
+
+```{r merging}
+cardio <- cardio %>%
+  clean_names() %>%
+  mutate(mortality_rate = observed_deaths/total_procedures) %>%
+  mutate(ratio_obs_exp = mortality_rate/expected_mortality_rate,
+         procedure_type = if_else(procedure_type == "Overall", 0, 
+                                  as.numeric(str_extract(procedure_type,"\\d"))))
+
+unc_data <- unc_data %>%
+  mutate(id = as.character(id),
+         mortality_rate = observed_deaths/total_procedures) %>% 
+  mutate(ratio_obs_exp = mortality_rate/expected_mortality_rate)
+
+cardio_comp <- bind_rows(cardio,unc_data) %>% 
+  mutate(procedure_type = factor(procedure_type))
+
+overall <- cardio_comp %>% 
+  filter(procedure_type == 0) 
+
+procedure_level <- cardio_comp %>% 
+  filter(procedure_type != 0) %>%
+  mutate(total_procedures_std = scale(total_procedures)) %>% 
+  arrange(hospital_name)
+
+numhospitals <- length(overall$hospital_name)
+
+hosp_vols <- overall %>% 
+  select(hospital_name, total_procedures) %>% 
+  mutate( volume = total_procedures) %>% 
+  select(-total_procedures)
+```
+
+## Introduction
+Patients often rely on publicly available hospital procedural performance metrics when deciding where to seek treatment. One such public repository is the Society for Thoracic Surgeons' (STS) Congenital Heart Surgery Database where patients can access a hospital reported performance information on complex heart surgeries across five procedure complexity-based categories (1 being less risky, and 5 most risky). Additionally, the STS provides a 3-star rating (1 = worse performance than average, 3 = higher performance than average) to each hospital based on their ratio of observed to expected mortality rates (O/E, 95\% C.I.), where a ratio less than 1 indicates performance is better than expected. Recently, UNC's hospital was forced to suspend their complex pediatric cardiovascular surgical procedures after the New York Times investigation reported it had higher than expected mortality rates. 
+
+Here we aim to investigate the factors that affect mortality rates, overall and stratified by procedure complexity, for hospitals in the STS's Congenital Heart Surgery Database and UNC (n =`r numhospitals`), as well as rank the top/bottom 10 hospitals based on predicted O/E performance (95\% CrI). Looking at both levels is relevant since factors such as the number of procedures can vary across hospitals and strata. Hierarchical models are often used to model outcomes such as mortality rates in our case since they take taking into account within group variability and allow for more precise  representations of hospital-to-hospital heterogeneity. However, in doing so, these models risk artificially shrinking mortality rate predictions of under-represented hospitals or high complexity procedures towards the population mortality rate. This is problematic since those procedures might have true high mortality rates that we wouldn't want to get shrunk.\footnote{E. I. George, V. Ročková, P. R. Rosenbaum, V. A. Satopää \& J. H. Silber (2017) Mortality Rate Estimation and Standardization for Public Reporting: Medicare’s Hospital Compare, Journal of the American Statistical Association, 112:519, 933-947, DOI: 10.1080/01621459.2016.1276021} To overcome this potential shortcomings, we will investigate and estimate mortality rates via a Bayesian framework to some suggested frameworks mentioned in George \textit{et. al.} (2017).
+
+## Exploratory Data Analysis
+
+The data comprises of compiled neonate, infant and children heart procedures from the `r numhospitals` hospitals from the STS's database and UNC publicly available data. For each hospital and nested complexity category strata, contains the number of observed deaths and number of procedures, as well as observed and expected mortality rates. As previously mentioned, category 1 represents the simplest procedures and category 5 the most complex, i.e. procedures associated with the highest risk of death. The observed mortality rates comprise deaths that both occur during hospitalization (up to 30 days), and those that happen within 30 days after being discharged from the hospital \footnote{Reference obtained from STS website: https://publicreporting.sts.org}.
+
+Prior to exploring the data, the total number of procedures was mean-centered `total_procedures_std` for efficiency.  First, we look at how mortality rates vary per procedure complexity (Figures 1.a) and by the total number of procedures (Figure 1.c). In Figure 1.a, we can observe that mortality rates vary not only among categories, each with a different spread, but also versus the overall hospital mean mortality rate (red). We can observe a similar behavior in Figure 1.c where hospitals with lower mortality rates also tend to have higher surgery volumes and those with higher mortality rates tend to have less volumes. Although some observations don't seem to follow this trend in Figure 1.c, we found that this due to the lack of any observed deaths reported (e.g. University of Kentucky Healthcare).  Similarly, we wished to explore potential among hospital mortality rate heterogeneity as seen in Figure 1.b. Here we can observe that each hospital seems to have a not only a different averages (i.e. intercept differences), but also a different slope based on volume thus suggesting adding both hospital and within-hospital volume random effects in our model. Given the category mortality rates provide a more granular view of each hospital, we decided to set apart the overall observations from the data set and continue our analysis on the stratified data only.
+
+
+```{r EDA, fig.height=8}
+#g1 <- procedure_level %>% 
+#  group_by(mortality_rate, hospital_name, procedure_type) %>% 
+#  ggplot(aes(x = log(total_procedures), y = log(mortality_rate), color = procedure_type)) + 
+#  geom_jitter(alpha = 0.5) + 
+#  theme_bw() +
+#  theme(legend.position = "none", 
+#        axis.text = element_text(size=10),
+#        axis.title=element_text(size=10),
+#        plot.title = element_text(size = 10)) +
+#  xlab("Log Total Procedures") + ylab("Log Mortality Rate") +
+#  ggtitle('Fig 1a. Mortality Rate vs Total Procedures')
+
+g1 <- procedure_level %>% 
+  ggplot(aes(x = procedure_type, y = log(mortality_rate), fill = procedure_type)) + 
+  geom_boxplot(outlier.alpha = 0.7) +
+  geom_hline(yintercept = log(mean(overall$mortality_rate)), color = "red") +
+  theme_bw() +
+  theme(legend.position = "none", 
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+       plot.title = element_text(size = 10)) +
+  xlab("Complexity category") + 
+  ylab("Log Mortality Rate") +
+  ggtitle('Fig 1a. Mortality Rate vs Category Complexity')
+
+g2 <-procedure_level %>% 
+  mutate(l_odds = log(mortality_rate/(1-mortality_rate))) %>% 
+  ggplot(aes(x = total_procedures_std, y = l_odds, color = hospital_name )) +
+  geom_jitter(alpha = 0.5) +
+  stat_smooth(geom = "line", method='lm', se = FALSE, alpha = 0.8) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+        plot.title = element_text(size = 10)) +
+  xlab("Standarized Total Procedures ") + ylab(" Empirical Log Odds (Mortality Rate)") + 
+  ggtitle('Fig 1b. Hospital-specific Correlations') 
+
+g3 <- procedure_level %>% 
+  group_by(mortality_rate, hospital_name, procedure_type) %>% 
+  ggplot(aes(x = total_procedures_std, y = log(mortality_rate), color = 
+               procedure_type)) + 
+  geom_jitter(alpha = 0.5) + 
+  facet_wrap(.~procedure_type, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+        plot.title = element_text(size = 10)) +
+  xlab("Standardized Total Procedures") + ylab("Log Mortality Rate") +
+  ggtitle('Fig 1c. Mortality Rate vs Total Std Procedures \n by Category') +
+  guides(color = guide_legend(title = "Category"))
+
+
+lay <- rbind(c(1,2),
+             c(3,3))
+grid.arrange(g1,g2,g3, layout_matrix = lay)
+
+```
+
+## Model
+Based on the EDA above, we chose to fit a multi-level hierarchical model that could account for among hospital heterogeneity as well as potential interactions between the category complexity and surgery volume. We choose specifically a Bayesian framework given some hospitals have very few or no observations, and we want to induce some shrinkage on those hospital estimates. The mortality rate at the category level has more information than the overall, because of this reason we preferred to model the mortality rate by complexity. Since we want to provide a general ranking, we will later combine the predictions and the star ratings of our model.
+
+Here we fit four similar models that included the same main effects - total procedures per category per hospital and procedure types. The models mainly differ based on inclusion/exclusion of an interaction between total procedures and complexity category, as well as hospital specific random effects or category specific random effects nested within hospitals. We used standardized total procedures in our model in an attempt to reduce some of the correlation between intercept and slope as seen in Figure 1.b. \newline
+For simplicity we first fitted a vanilla model `m1_corr0` with a hospital random intercept and no interaction as follows
+
+$$
+\begin{aligned}
+n_{\text{death},hj}&\sim Binomial(n_{hj}, m_{hj})\\
+logit(m_{hj})&=b_{0,h}+\beta_0+\beta_1*std(vol)_{hj}+\beta_{2-5}I(category=2,3,4,5)_{hj}\\
+b_{0h}&\sim N(\alpha, \sigma) \quad \quad \beta\sim N(0,10)\\
+\alpha&\sim N(0,1), \quad \quad \sigma\sim HalfCauchy(0,1)
+\end{aligned}
+$$
+
+
+where the number of observed deaths $n_{\text{death},hj}$ in hospital $h$ for procedure $j$ is distributed as a binomial with $n_{hj}$ trials (i.e. total_procedures) and mortality rate $0\leq m_{hj} \leq 1$. This mortality rate is then modeled via a logit link function where $b_{0,h}$ represents the hospital specific random effect and $\beta_{0-5}$ are fixed effects and $I(\cdot)$ is an indicator function for each of the categories (category `1` is the baseline). Priors were specified for the fixed effects and random effect mean as a standard normal, while the prior standard deviation for the random effect was set to be half cauchy to reflect our weak assumptions. However, based on George et al's proposed framework adding this as the only random effect might over-shrink hospital mortality rates of procedures which indeed are deadly.
+
+Thus, we fitted a linear emancipation of means model which added a hospital-specific random slope based on the normalized total procedure volumes in order to further explore the effects of surgical volumes across hospitals (`m1_corr1`). Initially we compared models that considered two separate models, one that considered correlated random effects priors and another with uncorrelated ones (`m1_corr1`, and `m1_uncorr` - not shown). However, as  previously mentioned and shown in Figure 1b above, we can observe the correlations between intercept and slope for the empirical log odds mortality rate. Therefore, to provide additional flexibility on our posterior estimates we used an LKJ prior for the correlation and variation structures of our random effects.\newline
+
+Additionally, we considered models that included nested categories categories within hospitals to compare whether it was reasonable to consider category-specific intercept and slopes for each hospital (`m1_corr_nested` and `m1_corr_nested2`). As mentioned, we also wished to explore whether there was an interaction effect between the procedure volumes and the category types (`m1_corr2`).
+
+
+```{r model, echo=FALSE, eval=FALSE, include=FALSE}
+# Vanilla model
+m1_corr0 <- brm(data = procedure_level, family = binomial,
+                observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std + procedure_type + (1  | hospital_name),
+                prior = c(prior(normal(0, 10), class = Intercept),
+                          prior(normal(0, 1), class = b),
+                          prior(cauchy(0, 2), class = sd)),
+                iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                seed = 13,
+                control = list(adapt_delta = .99,
+                               max_treedepth = 12))
+
+save(m1_corr0, file = 'model0.RData')
+
+# interactions and non-nested
+
+m1_corr1 <- brm(data = procedure_level, family = binomial,
+                observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std + procedure_type  + total_procedures_std*procedure_type + (1 + total_procedures_std | hospital_name),
+                prior = c(prior(normal(0, 1), class = Intercept),
+                          prior(normal(0, 1), class = b),
+                          prior(cauchy(0, 2), class = sd),
+                          prior(lkj(2), class = cor)),
+                iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                seed = 13,
+                control = list(adapt_delta = .99,
+                               max_treedepth = 12))
+
+save(m1_corr1, file = 'model.RData')
+
+
+
+# No interactions, non-nested
+m1_corr2 <- brm(data = procedure_level, family = binomial,
+                observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std + procedure_type  + (1 + total_procedures_std | hospital_name),
+                prior = c(prior(normal(0, 1), class = Intercept),
+                          prior(normal(0, 1), class = b),
+                          prior(cauchy(0, 2), class = sd),
+                          prior(lkj(2), class = cor)),
+                iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                seed = 13,
+                control = list(adapt_delta = .99,
+                               max_treedepth = 12))
+save(m1_corr2, file = 'm1_corr2.RData')
+
+# Nested model 1, fixed effects for procedure type included
+m1_corr_nested <- brm(data = procedure_level, family = binomial,
+                      observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std + procedure_type + procedure_type*total_procedures_std + (1 + total_procedures_std | hospital_name/procedure_type),
+                      prior = c(prior(normal(0, 1), class = Intercept),
+                                prior(normal(0, 1), class = b),
+                                prior(cauchy(0, 1), class = sd),
+                                prior(lkj(2), class = cor),
+                                prior(lkj(2), class = cor, group = hospital_name:procedure_type)),
+                      iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                      seed = 13,
+                      control = list(adapt_delta = .99,
+                                     max_treedepth = 12))
+
+# Nested model 2, no fixed effects for procedure type
+m1_corr_nested2 <- brm(data = procedure_level, family = binomial,
+                       observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std  + (1 + total_procedures_std | hospital_name/procedure_type),
+                       prior = c(prior(normal(0, 1), class = Intercept),
+                                 prior(normal(0, 1), class = b),
+                                 prior(cauchy(0, 1), class = sd),
+                                 prior(lkj(2), class = cor),
+                                 prior(lkj(2), class = cor, group = hospital_name:procedure_type)),
+                       iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                       seed = 13,
+                       control = list(adapt_delta = .99,
+                                      max_treedepth = 12))
+
+
+
+#save(m1_corr0,m1_corr1,m1_corr2,m1_corr_nested2,m1_corr_nested2, file = 'models.RData')
+```
+
+```{r load_models, echo=FALSE}
+# Load vanilla and m1_corr1 model data
+load('model0.RData')
+load('model.RData')
+```
+
+
+```{r loo_compare_brms, eval=FALSE, include=FALSE}
+# LOOCV comparisons
+(loo0 <- loo(m1_corr0, reloo = TRUE))
+(loo1 <- loo(m1_corr1, reloo = TRUE))
+(loo2 <- loo(m1_corr2, reloo = TRUE))
+(loo_nested <- loo(m1_corr_nested, reloo = TRUE))
+(loo_nested2 <- loo(m1_corr_nested2, reloo = TRUE)) # Excluded from analysis, took too long
+save(loo0,loo1,loo2,loo_nested,file = 'loo.RData')
+
+
+pred0 <- predict(m1_corr0) %>% as_tibble()
+pred1 <- predict(m1_corr1) %>% as_tibble()
+pred2 <- predict(m1_corr2) %>% as_tibble()
+pred_nested <- predict(m1_corr_nested) %>% as_tibble()
+save(pred0, pred1, pred2, pred_nested, file = "preds.RData")
+```
+
+In order to determine the model, we assess the models' leave-out-out cross-validation (LOOCV) error by estimating the expected log predictive density (ELPD). Table 1 below shows the results of the four out of the five models, with the first row being the model with the best performance (lowest cross-validation error).  The rest of the rows show the  ELPD difference relative to the best model. From this comparison model `m1_corr1`, the model with hospital specific random slope/intercept, and an interaction between total procedures and procedure type is preferred. Similarly, we computed the in-sample root mean squared error (RMSE) as a further comparison and didn't see any significant differences between `m1_corr1` and `m1_corr_nested` models. Thus we choose to interpret the results from this model in the following section. The second cross nested model was excluded from this analysis given the LOOCV would have taken several days, implying this model might not be the best one. Furthermore, diagnostics of convergence, including traceplots and effective sample size, were analyzed (not shown) the MCMC chains seem to have converged.
+
+```{r loo_rmse_table, echo = FALSE}
+# Load LOOCV data
+load("loo.RData")
+compare <- as.data.frame(loo_compare(loo0, loo1, loo2, loo_nested))
+
+# Load prediction data
+load("preds.RData")
+
+rmse <- function(ytrue, ypred){ # Helper function
+  sqrt(mean((ytrue - ypred)^2))
+}
+
+# Compute RMSEs
+y_true <- procedure_level$observed_deaths
+rmse_df <- data_frame(RMSE = c(rmse(y_true, pred1$Estimate),
+                               rmse(y_true, pred_nested$Estimate),
+                               rmse(y_true, pred2$Estimate),
+                               rmse(y_true, pred0$Estimate)))
+                               
+# Complete table and display
+compare <- bind_cols(compare[,1:4], rmse_df)
+kable(compare, caption = "Model Comparison", digits = 2, format = "markdown")
+```
+  
+
+Therefore, our final model `m1_corr1` is the following
+
+  
+$$
+\begin{aligned}
+n_{\text{death},hj}&\sim Binomial(n_{hj}, m_{hj})\\
+logit(m_{hj})&=\alpha_{0,h}+\beta_0+\beta_1*std(vol)_{hj}+\beta_{2-5}I(pt=2,3,4,5)_{hj}\\
+&+\beta_{6-9}std(vol)_{hj}*I(pt=2,3,4,5)\\
+\beta &\sim N(0,1)\\
+\alpha_{0,h}&=b_{0h}+b_{1h}*std(vol)_h\\
+\begin{pmatrix} b_{0,h}\\b_{1,h} \end{pmatrix}&\sim N(\alpha, D),\ \quad D=\begin{pmatrix} \tau_0&0\\0&\tau_1 \end{pmatrix}\Upsilon\begin{pmatrix} \tau_0&0\\0&\tau_1 \end{pmatrix}\\
+\tau_0&\sim HalfCauchy(0,2),\quad \tau_1\sim HalfCauchy(0,2)\\
+\alpha&\sim MVN(0,I)\\
+\Upsilon&=\begin{pmatrix} 1&\nu\\\nu&1 \end{pmatrix}\sim LKJcorr(2)
+\end{aligned}
+$$
+Similar to the vanilla model, the above model contains random and fixed effects. However, our final model includes a hospital volume random slope $b_{1,h}$ with an associated covariance structure $D$. This includes standard deviations $\tau_0$ and $\tau_1$, and correlation matrix $\Upsilon$. Again, to model our weak assumptions, half cauchy priors were used for the standard deviations and a diffuse LKJ prior for the our correlation structure.  
+    
+## Results
+
+### Posterior Estimates
+
+```{r standard_errors, echo = FALSE, message=FALSE}
+post_estim <- m1_corr1 %>%
+  gather_draws(`(b_.*)|(r_.*)|(sd_.*)`, regex = TRUE) %>% 
+  mean_hdi() %>% 
+  select(1:4) %>% 
+  set_names(c("variable", "estimate", "q2_5", "q97_5")) %>% 
+  mutate(estimate = exp(estimate),
+         q2_5 = exp(q2_5),
+         q97_5 = exp(q97_5))
+
+sd_estimates <- post_estim %>% 
+  filter(str_starts(variable, "sd")) %>% 
+  mutate(variable = c("Intercept", "total_procedures_std"))
+
+```
+
+Posterior estimates of the random effect standard errors are shown in Table 2 below with their associated 95\% confidence intervals. The random intercept standard deviation is `r sd_estimates$estimate[1]` while the random slope's is `r sd_estimates$estimate[2]`. The correlation between the random effects is `r VarCorr(m1_corr1)$hospital_name$cor[2]`. The relative variance explained by the intercept is `r sd_estimates$estimate[1]/(sd_estimates$estimate[1] + sd_estimates$estimate[2]+ sd(residuals(m1_corr1)[,1]))`, for the slope is `r sd_estimates$estimate[2]/(sd_estimates$estimate[1] + sd_estimates$estimate[2]+ sd(residuals(m1_corr1)[,1]))` the rest is explained by the residuals. 
+
+```{r}
+knitr::kable(sd_estimates, digits = 3, 
+      caption = "Intercept and Slope Posterior Std Dev Estimates (Odds Ratio) ",
+      format = "markdown",
+      col.names = c("Variable", "Post Estim", "2.5%", "97.5%"))
+```
+
+Similarly, Table 3 below displays the posterior estimates and associated 95\% CrI for all the fixed effects (non of which include zero and thus provide confidence the effects aren't zero). Here we observe that for a unit increase in the procedures of category 1 (baseline) in typical hospital ($b_0,h = b_1,h = 0$) the odds of a higher mortality rate is close to zero. Compared to a unit increase procedure type 5 in a typical hospital, we see an increased odds of mortality by a factor of `r post_estim$estimate[5]` with a (`r post_estim$q2_5[5]`,`r post_estim$q97_5[5]`) 95% CI, everything else constant. Additionally, if we increase the number of total procedures by 1 standard deviation we expect on average an decrease in the odds of mortality  by a factor of `r post_estim$estimate[6]` with a (`r post_estim$q2_5[5]`,`r post_estim$q97_5[5]`) 95% CI, having everything else constant. 
+
+Now, looking at the interaction effects on a typical hospital we can see these have mixed effects on the odds where increasing the number of procedures done on category two will lead to an increase in odds by `r post_estim$estimate[2]*post_estim$estimate[6]*post_estim$estimate[7]` on average, leaving everything else constant. Overall, it seems the mortality odds increase as the procedure complexity increase as expected and there seem to be differences amongst how the odds increase/decrease based on procedure volumes and complexity. 
+
+Similarly, we explored the posterior estimates for the random effects $b_0,h$ and $b_1,h$ as shown in Figure 2 below (hospitals were numbered 1-83 based on alphabetical order). We can observe clear differences among hospitals specific slopes and intercepts. We observe `UF Health Shands Children's Hospital` having the smallest intercept value yet one of the largest slope values, and `Children's Healthcare of Atlanta` having the largest values of the intercept and the smallest for the slope. The intercepts can be interpreted as multiplicative deviations from the odds of a typical hospital doing procedures of category 1. Overall, none of the 95\% credible intervals provided are include zero providing stronger evidence that these effects are non-zero.
+
+
+```{r posterior_estimates, echo = FALSE, message=FALSE}
+# Get posterior estimates
+post_estim <- post_estim %>%
+  filter(str_starts(variable, "sd", negate = TRUE)) %>% 
+  mutate(variable = str_remove(variable, "(r|b|sd)_")) %>% 
+  mutate(variable = str_remove(variable, "hospital_name")) %>% 
+  mutate(variable = str_replace_all(variable, "\\[|\\]", "")) %>% 
+  mutate(variable = str_replace_all(variable, "\\.", " "),
+         variable = str_trim(variable)) 
+
+# get variable names cleaned
+var_name <- str_split(post_estim$variable, ",\\w", simplify = TRUE) %>% 
+  data.frame() %>% 
+  mutate(X2 = str_replace_all(X2, ".*tercept", "r_intercept")) %>% 
+  mutate(X2 = str_replace_all(X2, "otal_procedures_std", "r_slope")) %>% 
+  mutate(type = if_else(str_detect(X1, "_") | X1 == "Intercept",
+                        "fe", "re"))
+
+# Cleaned variable names
+post_estim <- bind_cols(var_name, post_estim) %>% 
+  mutate(variable = X1) %>% 
+  select(-X1)
+
+# Fixed effects final model
+post_estim1 <- post_estim %>% 
+  filter(type == "fe") %>% 
+  select(-X2, -type) 
+
+
+# Fixed effects table
+post_estim1 %>% 
+  kable(., digits = 3, caption = "Fixed Effects Posterior Estimates (Odds Ratios)", 
+        format = "markdown", 
+        col.names = c("Variable", "Post Est.", "2.5%", "97.5%"))
+
+# Random effects plot
+post_estim %>% 
+  filter(type == "re") %>%
+  mutate(re_type = X2,
+         hospital_name = str_trim(variable)) %>%
+  distinct(hospital_name, re_type, .keep_all = T) %>% 
+  select(hospital_name, re_type,  everything(), -X2, -type, -variable ) %>% 
+  mutate(hosp_id = rep(1:83, each = 2),
+         total_procedures = rep(hosp_vols$volume, each = 2)) %>% 
+  ggplot(aes(x = reorder(hosp_id, estimate), 
+             y = estimate, color = re_type)) +
+  geom_point() +
+  geom_linerange(aes(ymin = q2_5, ymax = q97_5), alpha = 0.5) +
+  theme_bw() +
+  facet_wrap(~re_type, scales = "free") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, size = 4, hjust = 0, vjust = 0.5),
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+        plot.title = element_text(size = 10)) +
+  ylab("Poserior Estimates (Odds Ratio)") + xlab("Hospital") + 
+  ggtitle('Fig 2. Random Effects by Hospital') 
+
+# Vanilla model estimates
+post_estim0 <- m1_corr0 %>%
+  gather_draws(`(b_.*)|(r_.*)|(sd_.*)`, regex = TRUE) %>% 
+  mean_hdi() %>% 
+  select(1:4) %>% 
+  set_names(c("variable", "estimate", "q2_5", "q97_5")) %>% 
+  mutate(estimate = exp(estimate),
+         q2_5 = exp(q2_5),
+         q97_5 = exp(q97_5))
+
+# Clean vanilla model estimate names
+post_estim0 <- post_estim0 %>%
+  filter(str_starts(variable, "sd", negate = TRUE)) %>% 
+  mutate(variable = str_remove(variable, "(r|b|sd)_")) %>% 
+  mutate(variable = str_remove(variable, "hospital_name")) %>% 
+  mutate(variable = str_replace_all(variable, "\\[|\\]", "")) %>% 
+  mutate(variable = str_replace_all(variable, "\\.", " "),
+         variable = str_trim(variable)) 
+
+var_name0 <- str_split(post_estim0$variable, ",\\w", simplify = TRUE) %>% 
+  data.frame() %>% 
+  mutate(X2 = str_replace_all(X2, ".*tercept", "r_intercept")) %>% 
+  mutate(X2 = str_replace_all(X2, "otal_procedures_std", "r_slope")) %>% 
+  mutate(type = if_else(str_detect(X1, "_") | X1 == "Intercept",
+                        "fe", "re"))
+# Vanilla model posterior esitmates with cleaned names
+post_estim0 <- bind_cols(var_name0, post_estim0) %>% 
+  mutate(variable = X1) %>% 
+  select(-X1)
+
+```
+
+Finally, we did some sanity checking on our model to ensure that including the volume random effect had the intended effect of preventing estimates to be artificially shrunk toward the overall mean. Figures 3a and 3b below compare the combined fixed and random effects posterior estimates per hospital ($\hat{\alpha}_h$ in log odds) of the vanilla model and our final model, similar to what was done in George et al (2017). We can see that in adding the random slope leads to negative relation between $\hat{\alpha}_h$ and the total procedure increases without shrinking the low volume hospital estimates, as we were hoping for. In comparison, in Fig 3a we observe the artificial shrinkage of the low volume hospital estimates and random relation between $\hat{\alpha}_h$ and volume when we exlcude the volume covariate. \newline
+
+```{r shrinkage_plot, echo = FALSE, fig.height=3.5}
+# Obtain posterior random effects from final model
+post_re <- post_estim %>% 
+  filter(type == "re") %>% 
+  mutate(re_type = X2,
+         hospital_name = str_trim(variable)) %>%
+  distinct(hospital_name, re_type, .keep_all = T) %>% 
+  select(hospital_name, re_type,  everything(), -X2, -type, -variable ) %>% 
+  mutate(hosp_id = rep(1:83, each = 2),
+         total_procedures = rep(hosp_vols$volume, each = 2))
+
+# Extract random intercept
+r_int <- post_re %>% 
+  filter(re_type == "r_intercept") %>% 
+  mutate(int_est = log(estimate ))
+
+# Extract random slope
+r_slope <- post_re %>% 
+  filter(re_type == "r_slope") %>% 
+  mutate(slope_est = log(estimate)) %>% 
+  select(slope_est)
+
+# Get posterior fixed effects
+post_fe <- post_estim %>% 
+  filter(type == "fe") %>% 
+  select(-X2, -type) %>% 
+  mutate(estimate = log(estimate))
+
+# Shrinkage final model plot
+shr1 <- cbind(r_int, r_slope) %>% 
+  mutate(alpha = int_est + post_fe$estimate[1] + (slope_est +post_fe$estimate[6])*total_procedures ) %>% 
+  ggplot(aes(x = total_procedures, y = alpha)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+        plot.title = element_text(size = 10)) +
+  xlab("Total Procedures") + ylab(expression(hat(alpha)[h])) +
+  ggtitle('Fig 3b. Model with volume')
+
+
+### Vanilla model shrinkage
+post_re <- post_estim0 %>% 
+  filter(type == "re") %>% 
+  mutate(re_type = X2,
+         hospital_name = str_trim(variable)) %>% 
+  distinct(hospital_name, re_type, .keep_all = T) %>% 
+  select(hospital_name, re_type,  everything(), -X2, -type, -variable ) %>% 
+  mutate(hosp_id = 1:83,
+         total_procedures = hosp_vols$volume)
+
+r_int <- post_re %>% 
+  filter(re_type == "r_intercept") %>% 
+  mutate(int_est = log(estimate ))
+
+post_fe <- post_estim0 %>% 
+  filter(type == "fe") %>% 
+  select(-X2, -type) %>% 
+  mutate(estimate = log(estimate))
+
+# Vanilla model shrinkage plot
+shr0 <-  r_int %>% 
+  mutate(alpha = int_est + post_fe$estimate[1] ) %>% 
+  ggplot(aes(x = total_procedures, y = alpha)) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size=10),
+        axis.title=element_text(size=10),
+        plot.title = element_text(size = 10)) +
+  xlab("Total Procedures") + ylab(expression(hat(alpha)[h])) +
+  ggtitle('Fig 3a. Model without volume')
+
+lay <- rbind(c(1,2))
+grid.arrange(shr0,shr1,layout_matrix=lay)
+```
+
+### Predicted Mortality Rates and Ratios
+
+We generated predictions for the number of observed deaths for each category 1-5 per hospital via the posterior predictive distribution generated from our model. The associated 95\% credible intervals were generated via the highest posterior density interval (HPDI) framework given it a more robust measure to compute these intervals in case the posterior distribution is skewed. These were then converted into predicted mortality rates by dividing over the total number of procedures in the category, and then into the ratio dividing it by the expected mortality rate provided in the original dataset. Showing the benefits of the Bayesian framework, we were able predict mortality rates even for hospitals with zero reported deaths on hospitals while taking uncertainty into account. For example Akron Children's Hospital category 1 which had zero observed deaths and thus $O/E = 0$, was predicted to have an $\hat{O}/E = 1.29$ with wide 95\% CrI ($0, 4.11$). From our predictions, the highest $\hat{O}/E$ was $3.12$ ($0, 14.28$) for Children's Hospital of the King's Daughters category 5, and the lowest was $0.44$ ($0,0.94$) for Penn State's hospital in the same category.
+
+```{r predictions_non_stratified, echo = FALSE}
+
+## Posterior predicted deaths with 95% CrI
+post_preds <- posterior_predict(m1_corr1) %>% 
+  data.frame()
+
+# Get estimates and 95% HPD inteval
+estimates <- colMeans(post_preds)
+hpdi_95 <- HPDinterval(as.mcmc(post_preds) ) %>% 
+  data.frame() %>% 
+  transmute(q2_5 = lower, q97_5 = upper)
+
+preds <- bind_cols(estimate = estimates, hpdi_95)
+
+# Build predicted O/E ratios and associated 95% CI 
+preds_df <- bind_cols(procedure_level, preds) %>% 
+  mutate(pred_deaths = estimate,
+         pred_mortality_rate = estimate/total_procedures,
+         q2_5 = q2_5/total_procedures,
+         q97_5 = q97_5/total_procedures) %>% 
+  mutate(pred_ratio_obs_exp = pred_mortality_rate/expected_mortality_rate,
+         q2_5 = q2_5/expected_mortality_rate,
+         q97_5 = q97_5/expected_mortality_rate) %>% 
+  select(hospital_name, procedure_type, mortality_rate, expected_mortality_rate,
+         ratio_obs_exp, pred_mortality_rate, pred_ratio_obs_exp, q2_5, q97_5, total_procedures)
+
+```
+
+### Hospital Ranking
+
+Given hospital overall ranking can be misleading, we ranked hospitals both by category and overall. Think about hospitals that have lots of category 1 and 2 procedures with low mortality rate and very few category 5 with high mortality rate. The overall ranking doesn't fully capture this granularity that could be helpful for patients assessing whether a hospital is well ranked for the procedure they intend to undergo. Thus, we used a modified version of the alternative STS 3-star ranking system using the posterior predictions and credible intervals from our Bayesian framework to rank the hospitals in our dataset.
+
+Given our dataset contains 83/93 (90\%) hospitals in the STS website, we decided to use the mean predicted mortality ratio ($\hat{O}/E$) for each category as the point of reference given we don't have overall STS means. Then, we calculated the probability that the hospital's posterior predicted mortality ratio exceeded the mean, i.e. $Pr(\hat{O}/E > \mathbb{E}[\hat{O}/E])$ using posterior predictive samples for each category in each hospital. If the hospital's posterior probability was 0.975 or greater (i.e. all but the lower 2.5\% of the posterior samples were greater than the mean), we give it one star. Three stars were awarded to hospitals which the posterior probability was 0.025 or lower, and two stars otherwise. Table 4 below shows the percent 2 and 3 star hospitals out of the total per category given no hospitals were given a 1 star rating mostly due to some hospital predictions having very wide credible intervals. We can see that all hospital categories 1-3 were given two stars, while some hospitals where given star rating 3 for category 4 (e.g. Boston Children's Hospital) and 5 (Children's Hospital of Los Angeles). 
+
+```{r }
+# Get average O/E predicted ratios per procedure type
+p_means <- preds_df %>% 
+  group_by(procedure_type) %>% 
+  summarize(mu = mean(pred_ratio_obs_exp))
+    
+
+# Compute ratios for each draw
+ratios <- apply(post_preds, 1, function(x){ 
+  (x/procedure_level$total_procedures)/procedure_level$expected_mortality_rate}) %>% 
+  data.frame() %>% 
+  bind_cols(procedure_type = procedure_level$procedure_type,
+            hospital_name  = procedure_level$hospital_name, .)
+
+
+
+# Now manage dataframe to compare each draw O/E ratio to mean per procedure type
+post_ratios <- ratios %>% 
+  gather(key, val, -procedure_type, -hospital_name) %>%  # tidying up data for easy comparison
+  left_join(., p_means, by = "procedure_type") %>% 
+  mutate(val = val > mu) %>% # Comparison is done
+  select(-mu)  %>% 
+  group_by(key) %>% 
+  mutate(grouped_id = row_number()) %>% 
+  spread(key, val) %>%   # splitting up data for easy rowMeans calculation
+  select(-grouped_id) 
+
+# Get probabilities for star ratings
+probs <- rowMeans(post_ratios %>% select(-procedure_type, -hospital_name))
+
+# Appends probabilities and run rating
+# If Posterior prob is .975 or higher than procedure_type mean O/E ratio (i.e. only lower tail isn't > mean), assign 1
+# If posterior prob is 0.025 or lower ... (i.e. only higher tail  is > mean), assign 2
+# assign 2 otherwise
+post_ratings <- post_ratios %>% 
+  select(procedure_type, hospital_name) %>% 
+  bind_cols(., post_probs = probs) %>% 
+  left_join(., p_means, by = "procedure_type") %>%
+  ungroup() %>% 
+  arrange(hospital_name) %>% 
+  mutate(total_procedures = procedure_level$total_procedures) %>%
+  left_join(., hosp_vols, by = "hospital_name") %>% 
+  mutate(star_rating = case_when(
+    post_probs >= 0.975 ~ 1,
+    post_probs <= 0.025 ~ 3,
+    TRUE    ~ 2
+  )) %>% 
+  mutate(weight = volume/total_procedures)
+
+# Category ratings table
+post_ratings %>%
+  dplyr::count(procedure_type, star_rating) %>% 
+  group_by(procedure_type) %>% 
+  mutate(n = n/nrow(hosp_vols)) %>% 
+  kable(., col.names = c("Procedure Category", "Star Rating", "% of Total"),
+        digits = 3, format = "markdown")
+
+# Get weights for overall ratings
+preds_df <- preds_df %>% 
+  cbind(weight = post_ratings$weight)
+
+# Overall ratings
+overall_rating <- post_ratings %>%
+  group_by(hospital_name) %>% 
+  mutate(norm_w = sum(weight)) %>% 
+  mutate(weight = weight/norm_w) %>% 
+  mutate(w_stars = star_rating*weight) %>% 
+  group_by(hospital_name) %>% 
+  summarize(overall_rating = ceiling(sum(w_stars)))
+
+# Rank hospitals
+overall_ranking <- preds_df %>%
+  group_by(hospital_name) %>% 
+  mutate(norm_w = sum(weight)) %>% 
+  mutate(weight = weight/norm_w) %>% 
+  mutate(adj_ratio = pred_ratio_obs_exp*weight) %>% 
+  group_by(hospital_name) %>% 
+  summarize(overall_ratio = sum(adj_ratio)) %>%
+  arrange(overall_ratio)
+
+overall_star <- overall_rating %>%
+  mutate(star = 2+ 1*(overall_rating > 2)) %>%
+  select(hospital_name, star)
+
+```
+
+Finally for the overall rating system, we decided to do a weighted average for the star rating within each of the five categories per hospital. We believe that categories with lower volume within a hospital should have a greater weight, which also tend to be more complex procedures. This is because volume procedures seem to have a higher mortality rate and we do not expect successful less complex surgeries to account for these high risk ones. Our formulas for the final overall rating are the following:
+$$
+  \begin{aligned}
+w_i &= \frac{\sum_i vol_i}{vol_i} \\
+star &=\sum_i \frac{w_i}{\sum_i w_i} star_i
+  \end{aligned}
+$$
+
+Based on this method, we ranked the top and bottom 10 hospitals in Table 5 below. All the hospitals in top 10 have a 3 star rating and were ordered by increasing predicted mortality ratios. The rest of the hospitals are 2 star rating again ordered with increasing predicted ratios.
+
+```{r table for the ranking, echo=FALSE}
+# overall_star$hospital_name[overall_star$star > 2] %>% kable(col.names = NULL,caption # = "Hospitals in category 3", booktabs = F)
+
+overall_combine <- left_join(overall_ranking, overall_rating, by = "hospital_name") %>%
+  arrange(desc(overall_rating)) %>%
+  slice(1:10) %>%
+  arrange(overall_ratio)
+rank <- cbind(Top10 = overall_combine[1:10,1],
+              Worst10 = overall_ranking %>% 
+                arrange(desc(overall_ratio)) %>% 
+                select(hospital_name) %>%
+                slice(1:10))
+
+rank[8,1] <- "Riley Hospital for Children at Indiana University"
+rank[8,2] <- "Sutter Medical Center, Sacramento"
+kable(rank, caption = "Top and Bottom 10 Hospitals", 
+      col.names = c("Top 10", "Bottom 10"), format="markdown" )
+```
+
+
+
+## Conclusion & Future Work
+Having a more granular predictions allowed us to better understand the complexity of a hospital mortality rates . According to our model changing from procedure type 1 to procedure type 5 will increase your odds by a factor of 23. There is also a an interaction between the volume and the complexity. The higher the complexity, the more important is to have a higher volume of procedures within that category. For example, the 5 complexity level procedures that have one standard deviation volume more than the average, will decrease your odds by almost less than half. This is consistent with the general advice that George \textit{et. al.} mentioned.
+
+Our star rating and ranking is roughly consistent with the one used by the STS. Nevertheless, the star rating system we used was not ideal for the more complex categories, in which there were few observations leading to wider confidence intervals for the predicted mortality odds. This behavior is preventing those hospitals that performed poorly in higher categories, such as UNC, to be categorized as a one star rating. After ranking the 2 star hospitals by the predicted ratio $\hat{O}/E$, UNC was in the 10 worst which is consisting with high empirical ratios. A better star rating system could be developed to avoid this.
+
+For our future models, we believe that including additional covariates a bout the hospitals infrastructure and demographics could help improve the predictions and potentially hospitals ratings. 
+
+<!-- This section includes code used to compare diffrent models, explore other options, prior to finding the final model-->
+```{r uncor_corr_model_comparisons, eval=FALSE, include=FALSE}
+m1_uncorr <- brm(data = procedure_level, family = binomial,
+                 observed_deaths | trials(total_procedures) ~ 1 + total_procedures_std + procedure_type  + total_procedures_std*procedure_type + (1 + total_procedures_std || hospital_name),
+                 prior = c(prior(normal(0, 1), class = Intercept),
+                           prior(normal(0, 1), class = b),
+                           prior(cauchy(0, 2), class = sd)),
+                 iter = 5000, warmup = 1000, chains = 4, cores = 4,
+                 seed = 13,
+                 control = list(adapt_delta = .99,
+                                max_treedepth = 12))
+
+
+## Uncorrelated model plots, comparing aggregate hospital vols and 
+## procedure specific vols
+uncorr_type_procedures <- rbind(coef(m1_uncorr)$hospital_name[, , 1],
+                                coef(m1_uncorr)$hospital_name[, , 2]) %>% 
+  as_tibble() %>% 
+  mutate(param   = c(paste("Intercept", 1:83), paste("volume", 1:83)),
+         reorder = c(83:1, 166:84)) %>% 
+  slice(84:166) %>% 
+  mutate(key = "Procedure Level Volumes",
+         model_type = "Uncorr")
+
+
+rbind(coef(m1_uncorr)$hospital_name[, , 1],
+      coef(m1_uncorr)$hospital_name[, , 2]) %>% 
+  as_tibble() %>% 
+  mutate(param   = c(paste("Intercept", 1:83), paste("total_procedures", 1:83)),
+         reorder = c(83:1, 166:84)) %>% 
+  slice(84:166) %>% 
+  ggplot(aes(x = reorder(param, reorder))) +
+  geom_hline(yintercept = 0, linetype = 3, color = "#8B9DAF") +
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5, y = Estimate, color = reorder < 84),
+                  shape = 20, size = 3/4) +
+  scale_color_manual(values = c("#394165", "#A65141")) +
+  xlab(NULL) +
+  coord_flip() +
+  theme(legend.position = "none",
+        axis.ticks.y    = element_blank(),
+        axis.text.y     = element_text(hjust = 0))
+
+
+# Correlated model
+corr_type_procedures <- rbind(coef(m1_corr)$hospital_name[, , 1],
+                              coef(m1_corr)$hospital_name[, , 2]) %>% 
+  as_tibble() %>% 
+  mutate(param   = c(paste("Intercept", 1:83), paste("volume", 1:83)),
+         reorder = c(83:1, 166:84)) %>% 
+  slice(84:166) %>% 
+  mutate(key = "Procedure Level Volumes",
+         model_type = "Corr")
+
+
+rbind(coef(m1_corr)$hospital_name[, , 1],
+      coef(m1_corr)$hospital_name[, , 2]) %>% 
+  as_tibble() %>% 
+  mutate(param   = c(paste("Intercept", 1:83), paste("total_procedures", 1:83)),
+         reorder = c(83:1, 166:84)) %>% 
+  slice(84:166) %>% 
+  ggplot(aes(x = reorder(param, reorder))) +
+  geom_hline(yintercept = 0, linetype = 3, color = "#8B9DAF") +
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5, y = Estimate, color = reorder < 84),
+                  shape = 20, size = 3/4) +
+  scale_color_manual(values = c("#394165", "#A65141")) +
+  xlab(NULL) +
+  coord_flip() +
+  ggtitle("Procedure Level Volumes - Correlated Model") + 
+  theme(legend.position = "none",
+        axis.ticks.y    = element_blank(),
+        axis.text.y     = element_text(hjust = 0))
+
+
+## Comparison corr and uncorr
+rbind(uncorr_type_procedures,
+      corr_type_procedures) %>% 
+  ggplot(aes(x = param)) +
+  geom_hline(yintercept = 0, linetype = 3, color = "#8B9DAF") +
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5, y = Estimate, color = model_type),
+                  shape = 20, size = 3/4, alpha = 0.5) +
+  xlab(NULL) +
+  coord_flip() +
+  facet_wrap(~ key, scales = "free_x") +
+  theme(legend.position = "bottom",
+        axis.ticks.y    = element_blank(),
+        axis.text.y     = element_text(hjust = 0))
+
+
+
+rbind(uncorr_type_procedures, corr_type_procedures) %>% 
+  ggplot(aes(x = param)) +
+  geom_hline(yintercept = 0, linetype = 3, color = "#8B9DAF") +
+  geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5, y = Estimate, color = model_type),
+                  shape = 20, size = 3/4, alpha = 0.5) +
+  xlab(NULL) +
+  coord_flip() +
+  facet_wrap(~ model_type, scales = "free_x") +
+  theme(legend.position = "bottom",
+        axis.ticks.y    = element_blank(),
+        axis.text.y     = element_text(hjust = 0))
+
+```
+
+
+```{r final_model_mixing, eval = FALSE, include=FALSE}
+post <- posterior_samples(m1_corr1, add_chain = T)
+
+post %>% 
+  select("b_Intercept","b_total_procedures_std", "b_total_procedures_std:procedure_type2", 
+         "cor_hospital_name__Intercept__total_procedures_std", 
+         "r_hospital_name[Akron.Children's.Hospital,Intercept]",
+         "r_hospital_name[Akron.Children's.Hospital,total_procedures_std]",
+         "chain", "iter") %>% 
+  gather(key, value, -chain, -iter) %>% 
+  mutate(chain = as.character(chain)) %>% 
+  
+  ggplot(aes(x = iter, y = value, group = chain, color = chain)) +
+  geom_line(size = 1/15) +
+  scale_color_manual(values = c("#80A0C7", "#B1934A", "#A65141", "#EEDA9D")) +
+  scale_x_continuous(NULL, breaks = c(1001, 5000)) +
+  ylab(NULL) +
+  theme(legend.position  = c(.825, .06),
+        legend.direction = "horizontal") +
+  facet_wrap(~key, ncol = 3, scales = "free_y")
+
+```
+

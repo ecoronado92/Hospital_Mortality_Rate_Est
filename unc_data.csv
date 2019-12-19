@@ -1,0 +1,7 @@
+﻿id,hospital_name,procedure_type,observed_deaths,total_procedures,expected_mortality_rate
+1000000000,UNC,0,25,393,0.03
+1000000000,UNC,1,1,94,0.004
+1000000000,UNC,2,2,136,0.014
+1000000000,UNC,3,4,70,0.016
+1000000000,UNC,4,11,81,0.078
+1000000000,UNC,5,7,12,0.173
